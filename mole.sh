@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # OpenWRT 24.10 / BusyBox ash
 # Subscription manager for Podkop
 # Developer: Salvatore (GitHub: @tickcount)
@@ -6,7 +6,7 @@
 set -eu
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-MOLE_VERSION="0.1.0"
+MOLE_VERSION="0.2.0"
 MOLE_REPO="tickcount/podkop-subscriptions"
 MOLE_RAW_URL="https://raw.githubusercontent.com/${MOLE_REPO}/refs/heads/main/mole.sh"
 
@@ -1152,6 +1152,76 @@ sub_pool_file() {
     printf '%s/%s.uris' "$CFG_POOL_DIR" "$1"
 }
 
+# _extract_v2ray_uris BODY_FILE — convert V2Ray/Xray JSON outbounds to proxy
+# URIs, one per line. Requires jq. Outputs to stdout; errors silenced.
+# Input may be a single object or an array of configs (Liberty-style panels
+# ship one config per node). Picks the first supported outbound per config;
+# the config-level `.remarks` becomes the URI fragment (display name).
+_extract_v2ray_uris() {
+    jq -r '
+        (if type=="array" then .[] else . end) |
+        . as $root |
+        (($root.remarks // "")
+          | split("\n") | join(" ")
+          | split("\r") | join(" ")
+          | split("\t") | join(" ")) as $tag |
+        (($root.outbounds // [])
+          | map(select(.protocol as $p |
+                       ["vless","trojan","shadowsocks"] | index($p) != null))
+          | .[0]) as $o |
+        select($o != null) |
+        ($o.streamSettings // {}) as $ss |
+        ($ss.network // "tcp") as $net |
+        ($ss.security // "none") as $sec |
+        if $o.protocol == "vless" then
+            (($o.settings.vnext // [{}])[0]) as $v |
+            (($v.users // [{}])[0]) as $u |
+            ([
+                "type=" + $net,
+                "security=" + $sec,
+                (if ($u.flow // "") != "" then "flow=" + $u.flow else empty end),
+                ($ss.realitySettings as $rs |
+                  if $rs and ($rs.publicKey // "") != "" then "pbk=" + $rs.publicKey else empty end),
+                ($ss.realitySettings as $rs |
+                  if $rs then "sid=" + ($rs.shortId // "") else empty end),
+                ($ss.realitySettings as $rs |
+                  if $rs and ($rs.serverName // "") != "" then "sni=" + $rs.serverName else empty end),
+                ($ss.realitySettings as $rs |
+                  if $rs and ($rs.fingerprint // "") != "" then "fp=" + $rs.fingerprint else empty end),
+                ($ss.tlsSettings as $tl |
+                  if $tl and ($tl.serverName // "") != "" then "sni=" + $tl.serverName else empty end),
+                ($ss.tlsSettings as $tl |
+                  if $tl and ($tl.fingerprint // "") != "" then "fp=" + $tl.fingerprint else empty end),
+                (if $net == "ws" and $ss.wsSettings and ($ss.wsSettings.path // "") != ""
+                    then "path=" + $ss.wsSettings.path else empty end),
+                (if $net == "ws" and $ss.wsSettings
+                    and (($ss.wsSettings.headers // {}).Host // "") != ""
+                    then "host=" + $ss.wsSettings.headers.Host else empty end),
+                (if $net == "grpc" and $ss.grpcSettings
+                    and ($ss.grpcSettings.serviceName // "") != ""
+                    then "serviceName=" + $ss.grpcSettings.serviceName else empty end)
+            ] | join("&")) as $q |
+            "vless://" + ($u.id // "") + "@" + ($v.address // "") + ":" +
+            (($v.port // 0) | tostring) + "?" + $q + "#" + $tag
+        elif $o.protocol == "trojan" then
+            (($o.settings.servers // [{}])[0]) as $s |
+            ([
+                "type=" + $net,
+                "security=" + (if $sec == "none" then "tls" else $sec end),
+                ($ss.tlsSettings as $tl |
+                  if $tl and ($tl.serverName // "") != "" then "sni=" + $tl.serverName else empty end)
+            ] | join("&")) as $q |
+            "trojan://" + ($s.password // "") + "@" + ($s.address // "") + ":" +
+            (($s.port // 0) | tostring) + "?" + $q + "#" + $tag
+        elif $o.protocol == "shadowsocks" then
+            (($o.settings.servers // [{}])[0]) as $s |
+            ((($s.method // "") + ":" + ($s.password // "")) | @base64 | gsub("="; "")) as $b64 |
+            "ss://" + $b64 + "@" + ($s.address // "") + ":" +
+            (($s.port // 0) | tostring) + "#" + $tag
+        else empty end
+    ' < "$1" 2>/dev/null
+}
+
 # _extract_singbox_uris BODY_FILE — convert sing-box JSON outbounds to proxy
 # URIs, one per line. Requires jq >= 1.6. Outputs to stdout; errors silenced.
 # Supports: vless (tcp/ws/grpc/reality/tls), shadowsocks, trojan, hysteria2.
@@ -1228,9 +1298,15 @@ extract_uris() {
 
     case "$_eu_ct" in
         *application/json*)
-            # JSON — try sing-box outbounds extraction (requires jq)
+            # JSON — try sing-box first, then V2Ray/Xray outbounds (both need jq).
+            # Liberty/panels sometimes ship an array of V2Ray configs with one
+            # proxy outbound per config + a top-level `remarks` display name,
+            # which the sing-box shape wouldn't match.
             if have_cmd jq; then
                 _extract_singbox_uris "$_eu_body" > "$_eu_tmp" 2>/dev/null || true
+                if ! [ -s "$_eu_tmp" ]; then
+                    _extract_v2ray_uris "$_eu_body" > "$_eu_tmp" 2>/dev/null || true
+                fi
             fi
             if ! [ -s "$_eu_tmp" ]; then
                 rm -f "$_eu_tmp"
@@ -2482,6 +2558,11 @@ do_add_subscription() {
     _userinfo="$(hdr_get "$_hdr" subscription-userinfo)"
     _refill="$(hdr_get "$_hdr" subscription-refill-date)"
     _announce_raw="$(hdr_get "$_hdr" announce)"
+    _routing="$(hdr_get "$_hdr" routing)"
+    _account="$(cd_filename "$(hdr_get "$_hdr" content-disposition)")"
+    _hwid_warn="0"
+    [ "$(hdr_get "$_hdr" x-hwid-max-devices-reached)" = "true" ] && _hwid_warn="1"
+    [ "$(hdr_get "$_hdr" x-hwid-limit)" = "true" ] && _hwid_warn="1"
 
     _pt="$(decode_profile_title "$_pt_raw")"
     _announce="$(decode_announce "$_announce_raw")"
@@ -2492,7 +2573,9 @@ do_add_subscription() {
     _exp="$(userinfo_field "$_userinfo" expire)";    [ -z "$_exp" ] && _exp=0
 
     _pool_file="$(sub_pool_file "$_new_id")"
-    extract_uris "$_body" "$_pool_file" >/dev/null
+    # HDR is required — without it extract_uris can't see Content-Type and
+    # falls through to the base64/plain-URI path, missing JSON payloads.
+    extract_uris "$_body" "$_pool_file" "$_hdr" >/dev/null
     # Build metadata sidecar (full meta — exclusions applied at read time)
     build_pool_meta "$_new_id"
     _count="$(compute_filtered_count "$_new_id")"
@@ -2512,64 +2595,121 @@ do_add_subscription() {
     rm -f "$_hdr" "$_body"
 
     # ── Metadata preview ──
+    # Layout mirrors subscription_view's box: name-only hero, identity
+    # (Group/Interval), billing (Username/Traffic/Expires/Refill), links
+    # (Website/Support/Routing). Node list + count live below the box.
     _prev_name="$_pt"
     [ -z "$_prev_name" ] && _prev_name="$(url_display "$URL" 40)"
-    _prev_ico="${ICO_OK}"
-    [ "$_http_code" -ge 400 ] 2>/dev/null && _prev_ico="${ICO_ERR}"
 
-    # Dedupe Web when its host matches the subscription URL host
-    if [ -n "$_webpage" ]; then
+    # Group preview — matches the auto-assignment logic below so the user
+    # sees exactly which group the subscription will land in on save.
+    _prev_group="$_pt"
+    [ -z "$_prev_group" ] && _prev_group="$(url_display "$URL" 30)"
+
+    # Website: prefer server-provided page URL; fall back to the sub URL
+    # (same rule as subscription_view). Dedupe when same host.
+    _prev_website="${_webpage:-${URL}}"
+    if [ -n "$_webpage" ] && [ -n "$URL" ]; then
         _prev_url_host="$(printf '%s' "$URL" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|/.*||; s|:.*||')"
         _prev_web_host="$(printf '%s' "$_webpage" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|/.*||; s|:.*||')"
-        [ "$_prev_url_host" = "$_prev_web_host" ] && _webpage=""
+        [ "$_prev_url_host" = "$_prev_web_host" ] && _prev_website="$URL"
     fi
 
     box_buf_reset
-    box_buf_line "  ${_prev_ico} ${W}${_prev_name}${NC}"
+    box_buf_line "  ${W}${_prev_name}${NC}"
 
+    # ── Identity ──
     box_buf_sep
-    box_buf_line "  ${A}Nodes${NC}     ${W}${_count}${NC}"
+    box_buf_line "  ${A}Group${NC}     ${W}${_prev_group}${NC}"
+    [ "$_interval_h" -gt 0 ] && box_buf_line "  ${A}Interval${NC}  ${DIM2}every ${_interval_h}h${NC}"
 
-    box_buf_sep
-    box_buf_line "  ${A}URL${NC}       ${W}$(url_display "$URL" 60)${NC}"
-
+    # ── Billing ──
     _has_billing=0
     _bw_add="$(fmt_traffic "$_up" "$_dn" "$_tot")"
-    [ -n "$_bw_add" ]   && _has_billing=1
+    [ -n "$_account" ] && _has_billing=1
+    [ -n "$_bw_add" ]  && _has_billing=1
+    [ "$_exp" != "0" ] && _has_billing=1
+    _refill_num="$(printf '%s' "$_refill" | sed 's/[^0-9].*//')"
+    [ -z "$_refill_num" ] && _refill_num=0
+    [ "$_refill_num" != "0" ] && _has_billing=1
+    # Preserve the old always-show-billing-section behavior so Expires/Never
+    # still renders even when the server sends no userinfo at all.
     _has_billing=1
     if [ "$_has_billing" = "1" ]; then
         box_buf_sep
-        [ -n "$_bw_add" ]   && box_buf_line "  ${A}Traffic${NC}   ${W}${_bw_add}${NC}"
+        [ -n "$_account" ] && box_buf_line "  ${A}Username${NC}  ${DIM2}${_account}${NC}"
+        [ -n "$_bw_add" ]  && box_buf_line "  ${A}Traffic${NC}   ${W}${_bw_add}${NC}"
         if [ "$_exp" != "0" ]; then
             box_buf_line "  ${A}Expires${NC}   ${W}$(fmt_ts "$_exp")${NC} ${DIM2}($(fmt_days_until "$_exp"))${NC}"
         else
             box_buf_line "  ${A}Expires${NC}   ${DIM2}Never${NC}"
         fi
+        [ "$_refill_num" != "0" ] && box_buf_line "  ${A}Refill${NC}    ${DIM2}$(fmt_ts "$_refill_num")${NC} ${DIM2}($(fmt_days_until "$_refill_num"))${NC}"
     fi
 
+    # ── Links ──
     _has_links=0
-    [ -n "$_support" ]       && _has_links=1
-    [ -n "$_webpage" ]       && _has_links=1
-    [ "$_interval_h" -gt 0 ] && _has_links=1
+    [ -n "$_prev_website" ] && _has_links=1
+    [ -n "$_support" ]      && _has_links=1
+    [ -n "$_routing" ]      && _has_links=1
     if [ "$_has_links" = "1" ]; then
         box_buf_sep
-        [ -n "$_support" ]       && box_buf_line "  ${A}Support${NC}   ${DIM2}${_support}${NC}"
-        [ -n "$_webpage" ]       && box_buf_line "  ${A}Web${NC}       ${DIM2}${_webpage}${NC}"
-        [ "$_interval_h" -gt 0 ] && box_buf_line "  ${A}Interval${NC}  ${DIM2}every ${_interval_h}h${NC}"
+        [ -n "$_prev_website" ] && box_buf_line "  ${A}Website${NC}   ${DIM2}$(url_display "$_prev_website" 64)${NC}"
+        [ -n "$_support" ]      && box_buf_line "  ${A}Support${NC}   ${DIM2}${_support}${NC}"
+        if [ -n "$_routing" ]; then
+            _prev_routing_name="$(decode_routing_name "$_routing")"
+            [ -z "$_prev_routing_name" ] && _prev_routing_name="${_routing%${_routing#??????????}}"
+            box_buf_line "  ${A}Routing${NC}   ${DIM2}${_prev_routing_name}${NC}"
+        fi
     fi
 
     box_buf_flush 50 88
     echo ""
+
+    if [ -n "$_routing" ]; then
+        echo -e "  ${DIM2}Routing rules provided by server — not applied by Podkop${NC}"
+        echo ""
+    fi
+
+    if [ "$_hwid_warn" = "1" ]; then
+        echo -e "  ${WARN_C}${ICO_WARN} Device limit reached${NC} ${DIM2}— subscription may be blocked on other devices${NC}"
+        echo ""
+    fi
 
     if [ -n "$_announce" ]; then
         echo -e "  ${WARN_C}!${NC} ${DIM2}${_announce}${NC}"
         echo ""
     fi
 
+    # Node-name preview so the user can sanity-check what's about to be saved.
+    # Mirrors the subscription-view listing, but with bullets instead of a
+    # numbered index. Cap at 20 so long subscriptions don't scroll the
+    # confirmation off-screen.
+    if [ "$_count" -gt 0 ] && [ -f "$_pool_file" ] && [ -s "$_pool_file" ]; then
+        echo -e "  ${DIM2}Nodes (${_count})${NC}"
+        _add_preview_max=20
+        _add_preview_i=0
+        while IFS= read -r _add_preview_uri; do
+            [ -z "$_add_preview_uri" ] && continue
+            _add_preview_i=$((_add_preview_i + 1))
+            [ "$_add_preview_i" -gt "$_add_preview_max" ] && continue
+            _add_preview_nm="$(uri_display_name "$_add_preview_uri")"
+            [ -z "$_add_preview_nm" ] && _add_preview_nm="(unnamed)"
+            echo -e "  ${B}•${NC} ${DIM2}›${NC} ${W}${_add_preview_nm}${NC}"
+        done < "$_pool_file"
+        if [ "$_add_preview_i" -gt "$_add_preview_max" ]; then
+            echo -e "  ${DIM2}  … and $((_add_preview_i - _add_preview_max)) more${NC}"
+        fi
+        echo ""
+    fi
+
     if [ "$_count" -eq 0 ]; then
         warn "Body contains no recognized node URIs (ss/trojan/vless/vmess/hy2/tuic/socks)"
-        confirm "Save anyway?" "n" || { cancelled; crumb_pop; return; }
     fi
+
+    _add_default="y"
+    [ "$_count" -eq 0 ] && _add_default="n"
+    confirm "Add subscription?" "$_add_default" || { cancelled; crumb_pop; return; }
 
     # ── Group assignment (fully automatic by profile-title) ──
     # No prompt: subs with the same profile-title always share one group.
@@ -3046,7 +3186,7 @@ do_subscription_view() {
                 PAUSE
                 ;;
             d|D)
-                if confirm "Delete subscription ${_sv_id}?" "n"; then
+                if confirm "Delete subscription \"${_hero_name}\"?" "n"; then
                     rm -f "$(sub_pool_file "$_sv_id")" "$(sub_meta_file "$_sv_id")" "$(sub_stale_file "$_sv_id")"
                     uci -q delete "mole.${_sv_id}" || true
                     uci commit mole
@@ -5322,20 +5462,72 @@ EOF
 case "${1:-}" in
     --cron)
         # Non-interactive: refresh all enabled subscriptions, auto-flush any
-        # managed podkop sections whose URI set changed. Output goes to the
-        # cron log via the crontab redirect.
-        _cron_ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)"
-        echo "[${_cron_ts}] mole --cron start"
-        refresh_all 1
-        _cron_errs=$?
+        # managed podkop sections whose URI set changed. Stdout+stderr go to
+        # the cron log via the crontab redirect. Every line is timestamped
+        # and color-free so the log stays greppable. We iterate explicitly
+        # (instead of delegating to refresh_all/flush_all_auto) because those
+        # helpers are tuned for the TUI (colors, spinners) and their silent
+        # mode emits nothing — leaving cron runs opaque when something fails.
+        _cts() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
+        echo "[$(_cts)] mole --cron start"
+
+        _cron_errs=0 _cron_ok=0 _cron_seen=0
+        for _cs in $(iterate_sub_names); do
+            _cs_en="$(sub_get "$_cs" enabled 1)"
+            [ "$_cs_en" = "0" ] && continue
+            _cron_seen=$((_cron_seen + 1))
+            _cs_title="$(sub_get "$_cs" custom_name)"
+            [ -z "$_cs_title" ] && _cs_title="$(sub_get "$_cs" profile_title)"
+            [ -z "$_cs_title" ] && _cs_title="$_cs"
+            _cs_prev="$(sub_get "$_cs" last_count 0)"
+            case "$_cs_prev" in ''|*[!0-9]*) _cs_prev=0 ;; esac
+            if refresh_subscription "$_cs" 1; then
+                _cs_count="$(sub_get "$_cs" last_count 0)"
+                case "$_cs_count" in ''|*[!0-9]*) _cs_count=0 ;; esac
+                _cs_delta=$((_cs_count - _cs_prev))
+                _cs_dtxt=""
+                [ "$_cs_delta" -gt 0 ] && _cs_dtxt=" (+${_cs_delta})"
+                [ "$_cs_delta" -lt 0 ] && _cs_dtxt=" (${_cs_delta})"
+                echo "[$(_cts)] cron refresh ${_cs_title} ok ${_cs_count} links${_cs_dtxt}"
+                _cron_ok=$((_cron_ok + 1))
+            else
+                _cs_err="$(sub_get "$_cs" last_error)"
+                [ -z "$_cs_err" ] && _cs_err="unknown"
+                _cs_http="$(sub_get "$_cs" last_http_status 0)"
+                echo "[$(_cts)] cron refresh ${_cs_title} FAIL: ${_cs_err} (HTTP ${_cs_http})"
+                _cron_errs=$((_cron_errs + 1))
+            fi
+        done
+        [ "$_cron_seen" -eq 0 ] && echo "[$(_cts)] cron refresh: no enabled subscriptions"
+
+        _cron_fl_changed=0 _cron_fl_seen=0
         if podkop_present; then
-            flush_all_auto 1
+            for _cft in $(mole_managed_sections); do
+                _cron_fl_seen=$((_cron_fl_seen + 1))
+                _cft_name="$(ps_get "$_cft" podkop_name "$_cft")"
+                if podkop_flush "$_cft"; then
+                    _cft_n="$(ps_get "$_cft" last_flush_count 0)"
+                    echo "[$(_cts)] cron flush ${_cft_name} ok ${_cft_n} links"
+                    _cron_fl_changed=$((_cron_fl_changed + 1))
+                else
+                    _cft_n="$(ps_get "$_cft" last_flush_count 0)"
+                    echo "[$(_cts)] cron flush ${_cft_name} noop ${_cft_n} links (in sync)"
+                fi
+            done
+            [ "$_cron_fl_seen" -eq 0 ] && echo "[$(_cts)] cron flush: no managed podkop sections"
+            if [ "$_cron_fl_changed" -gt 0 ]; then
+                echo "[$(_cts)] cron restart podkop (${_cron_fl_changed} section(s) changed)"
+                podkop_restart
+            fi
+        else
+            echo "[$(_cts)] cron flush skipped — podkop not installed"
         fi
+
         if [ "$_cron_errs" -eq 0 ]; then
-            echo "[${_cron_ts}] mole --cron ok"
+            echo "[$(_cts)] mole --cron ok (${_cron_ok}/${_cron_seen} refreshed, ${_cron_fl_changed}/${_cron_fl_seen} flushed)"
             exit 0
         else
-            echo "[${_cron_ts}] mole --cron ${_cron_errs} error(s)"
+            echo "[$(_cts)] mole --cron ${_cron_errs} error(s) (${_cron_ok}/${_cron_seen} refreshed, ${_cron_fl_changed}/${_cron_fl_seen} flushed)"
             exit "$_cron_errs"
         fi
         ;;
