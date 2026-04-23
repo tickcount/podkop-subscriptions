@@ -6,7 +6,7 @@
 set -eu
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-MOLE_VERSION="0.2.0"
+MOLE_VERSION="0.2.1"
 MOLE_REPO="tickcount/podkop-subscriptions"
 MOLE_RAW_URL="https://raw.githubusercontent.com/${MOLE_REPO}/refs/heads/main/mole.sh"
 
@@ -891,6 +891,17 @@ sanitize_uci_val() {
     printf '%s' "$1" | tr -d "'\"\n\r\\"
 }
 
+# strip_display_emoji STR — drop 4-byte UTF-8 sequences (emojis, flags,
+# pictographs) for display-only cleanup and trim whitespace. Cyrillic /
+# Latin (2-byte UTF-8) is preserved. We build the regex with printf so
+# BusyBox sed doesn't need \xNN escape support.
+strip_display_emoji() {
+    _sde_pat="$(printf '[\360-\367][\200-\277][\200-\277][\200-\277]')"
+    printf '%s' "$1" \
+        | sed "s/${_sde_pat}//g" \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 # url_to_sub_id URL — deterministic UCI name (sub_XXXXXXXX) from URL hash
 url_to_sub_id() {
     _h=""
@@ -1324,10 +1335,15 @@ extract_uris() {
             ;;
     esac
 
-    # Filter valid schemes, deduplicate by fragment-stripped key, validate port.
+    # Filter valid schemes, deduplicate by fragment-stripped key, validate port,
+    # drop placeholder/stub endpoints (host 0.0.0.0, localhost, etc.) that
+    # panels return when HWID is blocked / device quota is hit. Stub count is
+    # written to "${_eu_out}.stubs" so the caller can surface a warning.
+    _eu_stubs_f="${_eu_out}.stubs"
+    rm -f "$_eu_stubs_f"
     tr -d '\r' < "$_eu_tmp" \
         | grep -E '^(ss|vless|trojan|socks4|socks4a|socks5|hysteria2|hy2)://' 2>/dev/null \
-        | awk 'NF {
+        | awk -v STUBS_FILE="$_eu_stubs_f" 'NF {
             k = $0; sub(/#.*/, "", k)
             if (seen[k]++) next
             u = $0
@@ -1338,14 +1354,31 @@ extract_uris() {
             if (n < 2) next
             port = p[n]
             if (port !~ /^[0-9]+$/ || port+0 < 1 || port+0 > 65535) next
+            host = p[1]
+            if (host == "0.0.0.0" || host == "127.0.0.1" \
+                || host == "localhost" || host == "::" || host == "[::]") {
+                stubs++
+                next
+            }
             print $0
-        }' \
+        }
+        END { if (stubs > 0 && STUBS_FILE != "") print stubs > STUBS_FILE }' \
         > "$_eu_out" 2>/dev/null || true
 
     rm -f "$_eu_tmp"
     _n="$(wc -l < "$_eu_out" 2>/dev/null; true)"
     case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
     echo "$_n"
+}
+
+# extract_stubs_count POOL_FILE — print the number of placeholder/stub URIs
+# that the last extract_uris call rejected for this pool (0 if none).
+extract_stubs_count() {
+    _esc_f="${1}.stubs"
+    [ -f "$_esc_f" ] || { echo 0; return; }
+    _esc_n="$(head -n1 "$_esc_f" 2>/dev/null | tr -d ' \r\n')"
+    case "$_esc_n" in ''|*[!0-9]*) _esc_n=0 ;; esac
+    echo "$_esc_n"
 }
 
 # url_decode STR — percent-decode (%XX → byte). `+` is NOT converted to space
@@ -1805,6 +1838,9 @@ save_subscription() {
     uci set "mole.${_ss_id}.last_http_status=${META_LAST_HTTP_STATUS:-0}"
     uci set "mole.${_ss_id}.last_count=${META_LAST_COUNT:-0}"
     uci set "mole.${_ss_id}.last_error=${META_LAST_ERROR:-}"
+    uci set "mole.${_ss_id}.routing=${META_ROUTING:-}"
+    uci set "mole.${_ss_id}.account_name=${META_ACCOUNT_NAME:-}"
+    uci set "mole.${_ss_id}.hwid_warning=${META_HWID_WARNING:-0}"
 }
 
 # ─── Main-menu subscription list ─────────────────────────────────────
@@ -1820,16 +1856,57 @@ display_subs() {
     _MENU_GROUP_COUNT=0
     _MENU_GROUP_IDS=""
 
-    for _g in $(iterate_group_names); do
+    # Two-pass ordering: multi-sub groups first (they carry their own header
+    # and "s1 › Settings" row, so they anchor the layout visually), then
+    # solo cards below. Within each bucket the underlying UCI order is kept.
+    _multi_order=""
+    _solo_order=""
+    for _gorder in $(iterate_group_names); do
+        _gorder_subs="$(subs_in_group "$_gorder" | awk 'NF' | wc -l | tr -d ' ')"
+        [ "$_gorder_subs" = "0" ] && continue
+        if [ "$_gorder_subs" = "1" ]; then
+            _solo_order="${_solo_order} ${_gorder}"
+        else
+            _multi_order="${_multi_order} ${_gorder}"
+        fi
+    done
+
+    _prev_type=""
+    for _g in $_multi_order $_solo_order; do
         _subs="$(subs_in_group "$_g")"
         [ -z "$_subs" ] && continue
-        _MENU_GROUP_COUNT=$((_MENU_GROUP_COUNT + 1))
-        _MENU_GROUP_IDS="${_MENU_GROUP_IDS} ${_g}"
         _dn="$(group_get "$_g" display_name)"
         [ -z "$_dn" ] && _dn="$_g"
+        _sub_n="$(printf '%s\n' "$_subs" | awk 'NF' | wc -l | tr -d ' ')"
+        _curr_type="multi"
+        [ "$_sub_n" = "1" ] && _curr_type="solo"
+
+        # sN shortcut is only assigned to multi-sub groups. Solo groups are
+        # rendered as standalone cards without a header, so advertising
+        # "press s1 for settings" on them would be wrong — the index number
+        # would start mid-way (e.g. s3 for the first multi) just because
+        # solos ate the counter. Dispatcher indices follow `_MENU_GROUP_IDS`,
+        # so skipping solos there keeps `s1` aligned with the first multi.
+        if [ "$_curr_type" = "multi" ]; then
+            _MENU_GROUP_COUNT=$((_MENU_GROUP_COUNT + 1))
+            _MENU_GROUP_IDS="${_MENU_GROUP_IDS} ${_g}"
+            _gshort="s${_MENU_GROUP_COUNT}"
+            _dn_display="$(strip_display_emoji "$_dn")"
+            [ -z "$_dn_display" ] && _dn_display="$_dn"
+        fi
+
+        # Spacing rule: always one blank line between groups — solo cards
+        # now carry 2-3 rows each (name + row2 + announce), so tight packing
+        # made them blur together. Uniform padding reads cleaner.
         echo ""
-        echo -e "  ${W}${_dn}${NC}"
-        echo -e "      ${B}s${_MENU_GROUP_COUNT}${NC} ${DIM2}›${NC} ${W}Settings${NC}"
+
+        # Multi-sub group: header on its own line (cleaned display name) +
+        # Settings shortcut row underneath, then the sub rows. Solo groups
+        # skip both — a lone sub is effectively its own card.
+        if [ "$_curr_type" = "multi" ]; then
+            echo -e "  ${W}${_dn_display}${NC}"
+            echo -e "      ${B}${_gshort}${NC} ${DIM2}›${NC} ${W}Settings${NC}"
+        fi
         for _s in $_subs; do
             _MENU_SUB_COUNT=$((_MENU_SUB_COUNT + 1))
             _MENU_SUB_IDS="${_MENU_SUB_IDS} ${_s}"
@@ -1844,10 +1921,14 @@ display_subs() {
             _up_b="$(sub_get "$_s" traffic_upload 0)"
             _dn_b="$(sub_get "$_s" traffic_download 0)"
             _exp="$(sub_get "$_s" traffic_expire 0)"
+            _hwid="$(sub_get "$_s" hwid_warning 0)"
+            # Announce — strip \r/\t only; \n is preserved so multi-line
+            # panel messages can render as a short block under the row.
+            _ann="$(decode_announce "$(sub_get "$_s" announce)" | tr -d '\r\t')"
 
             # Defensive sanitize: older saves may contain "0\n0" multi-line
             # garbage from a past count_uri_schemes bug.
-            for _nv in _c _http _last_ts _tot _up_b _dn_b _exp; do
+            for _nv in _c _http _last_ts _tot _up_b _dn_b _exp _hwid; do
                 eval "_tmp=\${$_nv:-0}"
                 case "$_tmp" in ''|*[!0-9]*) eval "$_nv=0" ;; esac
             done
@@ -1861,25 +1942,82 @@ display_subs() {
                 _label="$(url_display "$_url" 38)"
             fi
 
-            _meta=""
-            if [ "$_tot" != "0" ]; then
-                _bw_ov="$(fmt_traffic "$_up_b" "$_dn_b" "$_tot")"
-                [ -n "$_bw_ov" ] && _meta="${_meta} · ${_bw_ov}"
+            # Row 1 carries just the essentials (links + age). Traffic +
+            # expiry are noisy enough to warrant their own line underneath —
+            # it reads more like a card, and the "Active until: …" phrasing
+            # is much clearer than a bare "363d".
+            _head1=""
+            if [ "$_hwid" = "1" ]; then
+                _head1="${WARN_C}⚠ HWID blocked${NC}"
             else
-                _used_ov="$(awk -v u="${_up_b:-0}" -v d="${_dn_b:-0}" 'BEGIN{print u+d}')"
-                [ "${_used_ov:-0}" != "0" ] && _meta="${_meta} · $(fmt_bytes "$_used_ov")"
+                _head1="${DIM2}${_c} links${NC}"
             fi
-            [ "$_exp" != "0" ] && _meta="${_meta} · $(fmt_days_until "$_exp")"
-            _meta="${_meta} · $(fmt_age_since "$_last_ts")"
 
-            if [ "$_en" = "0" ]; then
-                echo -e "      ${DIM2}$(printf '%2d' "$_MENU_SUB_COUNT") · ${_label}${NC}"
-            elif [ "$_http" -ge 400 ]; then
-                echo -e "      ${B}$(printf '%2d' "$_MENU_SUB_COUNT")${NC} ${DIM2}›${NC} ${W}${_label}${NC}  ${DIM2}${_c} links${_meta}  ${ERR}err ${_http}${NC}"
+            # Traffic: always go through fmt_traffic so the "/ ∞" suffix shows
+            # for unlimited plans. Suppress only when the sub is brand-new
+            # (zero used + zero total) and we'd be emitting "0.0 GB / ∞" noise.
+            _row2=""
+            _used_ov="$(awk -v u="${_up_b:-0}" -v d="${_dn_b:-0}" 'BEGIN{print u+d}')"
+            case "$_used_ov" in ''|*[!0-9]*) _used_ov=0 ;; esac
+            if [ "$_tot" != "0" ] || [ "$_used_ov" != "0" ]; then
+                _row2="$(fmt_traffic "$_up_b" "$_dn_b" "$_tot")"
+            fi
+            if [ "$_exp" != "0" ]; then
+                _exp_str="Active until: $(fmt_ts "$_exp") ($(fmt_days_until "$_exp"))"
+                _row2="${_row2:+${_row2} · }${_exp_str}"
+            fi
+
+            # Two indent profiles.
+            # Solo (no header above): sub row sits at top-level indent 2 and
+            # acts as its own card; meta/announce hang off the label column.
+            # Multi (header above): children indent 6 so the tree is obvious;
+            # meta/announce cascade deeper to stay under the label.
+            if [ "$_sub_n" = "1" ]; then
+                _pre="  "
+                _meta_pre="       "        # 7 spaces → aligns with label col
+                _cont_pre="         "      # 9 → announce continuation
             else
-                echo -e "      ${B}$(printf '%2d' "$_MENU_SUB_COUNT")${NC} ${DIM2}›${NC} ${W}${_label}${NC}  ${DIM2}${_c} links${_meta}${NC}"
+                _pre="      "
+                _meta_pre="           "    # 11 spaces
+                _cont_pre="             "  # 13
+            fi
+
+            _age="$(fmt_age_since "$_last_ts")"
+            if [ "$_en" = "0" ]; then
+                echo -e "${_pre}${DIM2}$(printf '%2d' "$_MENU_SUB_COUNT") · ${_label} · Disabled${NC}"
+            elif [ "$_http" -ge 400 ]; then
+                echo -e "${_pre}${B}$(printf '%2d' "$_MENU_SUB_COUNT")${NC} ${DIM2}›${NC} ${W}${_label}${NC}  ${_head1} ${DIM2}· ${_age}${NC}  ${ERR}err ${_http}${NC}"
+            else
+                echo -e "${_pre}${B}$(printf '%2d' "$_MENU_SUB_COUNT")${NC} ${DIM2}›${NC} ${W}${_label}${NC}  ${_head1} ${DIM2}· ${_age}${NC}"
+            fi
+
+            # Row 2: traffic + expiry in dim. Skipped when empty (e.g. subs
+            # with no userinfo header).
+            if [ -n "$_row2" ] && [ "$_en" != "0" ]; then
+                echo -e "${_meta_pre}${DIM2}${_row2}${NC}"
+            fi
+
+            # Server-side announce — preserves \n so multi-line messages
+            # read as a small block. First line gets the `!` badge; any
+            # continuation lines are indented under it.
+            if [ -n "$_ann" ] && [ "$_en" != "0" ]; then
+                _first_a=1
+                _oldifs="$IFS"
+                IFS='
+'
+                for _aln in $_ann; do
+                    case "$_aln" in "") continue ;; esac
+                    if [ "$_first_a" = "1" ]; then
+                        echo -e "${_meta_pre}${WARN_C}!${NC} ${DIM2}${_aln}${NC}"
+                        _first_a=0
+                    else
+                        echo -e "${_cont_pre}${DIM2}${_aln}${NC}"
+                    fi
+                done
+                IFS="$_oldifs"
             fi
         done
+        _prev_type="$_curr_type"
     done
 
     # Subscriptions whose group no longer exists
@@ -2206,8 +2344,13 @@ refresh_subscription() {
     uci set "mole.${_rs_id}.last_error="
     uci commit mole
 
+    _rs_stub_n="$(extract_stubs_count "$_rs_pool")"
     exec 9>&-
-    log_event "refresh ${_rs_id} ok ${_rs_count} links (HTTP ${_rs_http})"
+    if [ "$_rs_stub_n" -gt 0 ] 2>/dev/null; then
+        log_event "refresh ${_rs_id} ok ${_rs_count} links (HTTP ${_rs_http}, ${_rs_stub_n} stub(s) dropped)"
+    else
+        log_event "refresh ${_rs_id} ok ${_rs_count} links (HTTP ${_rs_http})"
+    fi
     return 0
 }
 
@@ -2576,6 +2719,7 @@ do_add_subscription() {
     # HDR is required — without it extract_uris can't see Content-Type and
     # falls through to the base64/plain-URI path, missing JSON payloads.
     extract_uris "$_body" "$_pool_file" "$_hdr" >/dev/null
+    _stub_n="$(extract_stubs_count "$_pool_file")"
     # Build metadata sidecar (full meta — exclusions applied at read time)
     build_pool_meta "$_new_id"
     _count="$(compute_filtered_count "$_new_id")"
@@ -2676,8 +2820,29 @@ do_add_subscription() {
         echo ""
     fi
 
+    # Stub rejection notice — panels return placeholder URIs (0.0.0.0:1) when
+    # HWID is blocked; we silently drop them so they don't poison the pool,
+    # but the user needs to know *why* real nodes are missing.
+    if [ "${_stub_n:-0}" -gt 0 ]; then
+        echo -e "  ${WARN_C}${ICO_WARN} Server returned ${_stub_n} placeholder node(s)${NC} ${DIM2}— ignored (usually means HWID/device limit)${NC}"
+        echo ""
+    fi
+
     if [ -n "$_announce" ]; then
-        echo -e "  ${WARN_C}!${NC} ${DIM2}${_announce}${NC}"
+        _first_ada=1
+        _oldifs_ada="$IFS"
+        IFS='
+'
+        for _adaln in $_announce; do
+            case "$_adaln" in "") continue ;; esac
+            if [ "$_first_ada" = "1" ]; then
+                echo -e "  ${WARN_C}!${NC} ${DIM2}${_adaln}${NC}"
+                _first_ada=0
+            else
+                echo -e "    ${DIM2}${_adaln}${NC}"
+            fi
+        done
+        IFS="$_oldifs_ada"
         echo ""
     fi
 
@@ -2737,6 +2902,9 @@ do_add_subscription() {
     META_LAST_HTTP_STATUS="$_http_code"
     META_LAST_COUNT="$_count"
     META_LAST_ERROR=""
+    META_ROUTING="$_routing"
+    META_ACCOUNT_NAME="$_account"
+    META_HWID_WARNING="$_hwid_warn"
 
     save_subscription "$_new_id" "$URL" "$_group_id"
     uci commit mole
@@ -2967,9 +3135,24 @@ do_subscription_view() {
             echo ""
         fi
 
-        # Post-box announcement banner
+        # Post-box announcement banner — multi-line supported. First line
+        # gets the `!` badge, continuation lines are indented under the text
+        # (not under `!`) so each new row lines up with the body.
         if [ -n "$_ann" ]; then
-            echo -e "  ${WARN_C}!${NC} ${DIM2}${_ann}${NC}"
+            _first_sva=1
+            _oldifs_sva="$IFS"
+            IFS='
+'
+            for _svaln in $_ann; do
+                case "$_svaln" in "") continue ;; esac
+                if [ "$_first_sva" = "1" ]; then
+                    echo -e "  ${WARN_C}!${NC} ${DIM2}${_svaln}${NC}"
+                    _first_sva=0
+                else
+                    echo -e "    ${DIM2}${_svaln}${NC}"
+                fi
+            done
+            IFS="$_oldifs_sva"
             echo ""
         fi
 
@@ -4550,7 +4733,10 @@ do_group_settings() {
         echo ""
         echo -e "  ${DIM2}Bulk${NC}"
         echo -e "  ${B}e${NC} ${DIM2}›${NC} ${OK}Enable${NC} All Subscriptions"
-        echo -e "  ${B}d${NC} ${DIM2}›${NC} ${ERR}Disable${NC} All Subscriptions"
+        echo -e "  ${B}o${NC} ${DIM2}›${NC} ${ERR}Disable${NC} All Subscriptions"
+        echo ""
+        echo -e "  ${DIM2}Danger${NC}"
+        echo -e "  ${B}d${NC} ${DIM2}›${NC} ${ERR}Delete Group${NC} ${DIM2}(removes ${_gs_count} subscription$([ "$_gs_count" = "1" ] || echo s))${NC}"
         echo ""
         echo -e "  ${DIM2}Enter › Back${NC}"
         echo ""
@@ -4588,7 +4774,7 @@ do_group_settings() {
                 echo -e "  ${ICO_OK} ${OK}All enabled${NC} ${DIM2}(${_gs_count} subs)${NC}"
                 PAUSE
                 ;;
-            d|D)
+            o|O)
                 if confirm "Disable all ${_gs_count} subscriptions in this group?" "n"; then
                     for _s in $(subs_in_group "$_gs_id"); do
                         uci set "mole.${_s}.enabled=0"
@@ -4596,6 +4782,63 @@ do_group_settings() {
                     uci commit mole
                     echo -e "  ${ICO_OK} ${OK}All disabled${NC}"
                     PAUSE
+                fi
+                ;;
+            d|D)
+                if confirm "Delete group \"${_gs_name}\" and all ${_gs_count} subscription(s)?" "n"; then
+                    # Track if any podkop section references this group so we
+                    # auto-flush once at the end (avoids a noisy flush per sub).
+                    _gs_linked=0
+                    if podkop_present; then
+                        for _gs_t in $(mole_managed_sections); do
+                            case " $(ps_sources "$_gs_t") " in
+                                *" $_gs_id "*) _gs_linked=1; break ;;
+                            esac
+                        done
+                    fi
+
+                    for _s in $(subs_in_group "$_gs_id"); do
+                        rm -f "$(sub_pool_file "$_s")" \
+                              "$(sub_pool_file "$_s").stubs" \
+                              "$(sub_meta_file "$_s")" \
+                              "$(sub_stale_file "$_s")"
+                        uci -q delete "mole.${_s}" || true
+                        log_event "sub delete ${_s} (group delete)"
+                    done
+
+                    # Strip dead group from any managed section's source_group
+                    # list so gather_planned_uris doesn't keep skipping it by
+                    # name forever.
+                    for _gs_t in $(mole_managed_sections); do
+                        _gs_src="$(ps_sources "$_gs_t")"
+                        _gs_new=""
+                        for _gs_g in $_gs_src; do
+                            [ "$_gs_g" = "$_gs_id" ] && continue
+                            _gs_new="${_gs_new:+${_gs_new} }${_gs_g}"
+                        done
+                        if [ "$_gs_src" != "$_gs_new" ]; then
+                            if [ -z "$_gs_new" ]; then
+                                uci -q delete "mole.${_gs_t}.source_group" 2>/dev/null || true
+                            else
+                                uci set "mole.${_gs_t}.source_group=${_gs_new}"
+                            fi
+                        fi
+                    done
+
+                    uci -q delete "mole.${_gs_id}" || true
+                    uci commit mole
+                    log_event "group delete ${_gs_id}"
+
+                    if [ "$_gs_linked" = "1" ]; then
+                        flush_all_auto 1 >/dev/null 2>&1 || true
+                    fi
+
+                    echo -e "  ${ICO_OK} ${OK}Group deleted${NC}"
+                    PAUSE
+                    # Bubble two levels back — this screen's group no longer
+                    # exists, and the caller's do_group_view would choke too.
+                    crumb_pop
+                    return
                 fi
                 ;;
             "") crumb_pop; return ;;
