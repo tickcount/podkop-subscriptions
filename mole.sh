@@ -6,7 +6,7 @@
 set -eu
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-MOLE_VERSION="0.2.1"
+MOLE_VERSION="0.2.2"
 MOLE_REPO="tickcount/podkop-subscriptions"
 MOLE_RAW_URL="https://raw.githubusercontent.com/${MOLE_REPO}/refs/heads/main/mole.sh"
 
@@ -513,11 +513,23 @@ ps_sources() {
     uci -q get "mole.$1.source_group" 2>/dev/null || true
 }
 
-# canonical_hash — strip #fragment, sort -u, sha256sum, print first 16 hex
-# chars. Fragment is a display name only — stripping it makes flush detection
-# robust to server-side display-name changes between refreshes.
+# canonical_hash — strip #fragment, strip reality `sid=…` query param,
+# sort -u, sha256sum, print first 16 hex chars.
+#
+# Fragment stripping: display names change often on the server side; we
+# don't want that to trigger a flush.
+#
+# sid stripping: Reality panels rotate the short_id on every subscription
+# fetch. Treating those as meaningful diffs would (a) spam the UI with
+# "⚠ flush needed" on every refresh and (b) trigger a podkop restart every
+# time cron runs — which drops the active connection for several seconds.
+# Servers typically keep previously-issued sids on their whitelist, so a
+# stale sid on the client usually still authenticates. This is an explicit
+# trade-off: if a server operator rotates their entire whitelist, mole
+# won't notice until the next refresh changes something else — the user
+# would need to flush manually from the Podkop section view.
 canonical_hash() {
-    sed 's/#.*//' 2>/dev/null \
+    sed -e 's/#.*//' -e 's/[?&]sid=[^&#]*//g' 2>/dev/null \
         | sort -u 2>/dev/null \
         | { sha256sum 2>/dev/null || md5sum 2>/dev/null || cksum; } \
         | awk '{print substr($1,1,16)}'
@@ -4444,6 +4456,7 @@ do_podkop_section_view() {
         else
             echo -e "  ${DIM2}p › Test Latency (flush first)${NC}"
         fi
+        echo -e "  ${B}d${NC} ${DIM2}›${NC} ${W}Show Diff${NC} ${DIM2}(planned vs podkop, URI-level)${NC}"
         echo -e "  ${B}u${NC} ${DIM2}›${NC} ${ERR}Unadopt Section${NC}"
         echo ""
         echo -e "  ${DIM2}Enter › Back${NC}"
@@ -4508,10 +4521,98 @@ do_podkop_section_view() {
                     crumb_pop; return
                 fi
                 ;;
+            d|D)
+                do_podkop_section_diff "$_psv_tag"
+                ;;
             "") crumb_pop; return ;;
             *) warn "Unknown option: ${PSV_CHOICE}"; PAUSE ;;
         esac
     done
+}
+
+# do_podkop_section_diff TAG — verbose debug view showing exactly which URIs
+# differ between mole's planned pool and podkop's current list. Useful when
+# `⚠ Flush Needed` fires without an obvious count change — usually means a
+# server rotated query-string params (sid, sessionId, …) or reordered list.
+do_podkop_section_diff() {
+    _dpsd_tag="$1"
+    _dpsd_name="$(ps_get "$_dpsd_tag" podkop_name "$_dpsd_tag")"
+    _dpsd_mode="$(ps_get "$_dpsd_tag" proxy_mode "urltest")"
+    case "$_dpsd_mode" in urltest|selector) ;; *) _dpsd_mode="urltest" ;; esac
+    _dpsd_list="${_dpsd_mode}_proxy_links"
+
+    _dpsd_plan="/tmp/mole-diff-${_dpsd_tag}.planned"
+    _dpsd_cur="/tmp/mole-diff-${_dpsd_tag}.podkop"
+    gather_planned_uris "$_dpsd_tag" | sort > "$_dpsd_plan"
+    podkop_current_uris "$_dpsd_name" "$_dpsd_list" | sort > "$_dpsd_cur"
+
+    _dpsd_pn="$(wc -l < "$_dpsd_plan" | tr -d ' ')"
+    _dpsd_cn="$(wc -l < "$_dpsd_cur" | tr -d ' ')"
+    _dpsd_ph="$(canonical_hash < "$_dpsd_plan")"
+    _dpsd_ch="$(canonical_hash < "$_dpsd_cur")"
+
+    clear
+    crumb_push "Diff"
+    crumb_show
+    section "Diff: planned vs podkop"
+    echo -e "  ${A}Section${NC}    ${W}${_dpsd_name}${NC} ${DIM2}(${_dpsd_mode})${NC}"
+    echo -e "  ${A}Planned${NC}    ${W}${_dpsd_pn}${NC} ${DIM2}links · hash ${_dpsd_ph}${NC}"
+    echo -e "  ${A}In podkop${NC}  ${W}${_dpsd_cn}${NC} ${DIM2}links · hash ${_dpsd_ch}${NC}"
+    echo ""
+
+    if [ "$_dpsd_ph" = "$_dpsd_ch" ]; then
+        echo -e "  ${OK}In sync — no diff.${NC}"
+    else
+        # Prefer `diff -u` if installed; otherwise do the set difference in
+        # awk — BusyBox drops `comm` from its default build, so we can't
+        # rely on it even as a fallback. The awk path loads both files into
+        # associative arrays and walks each side; output is colored inline
+        # (+ = in planned only, - = in podkop only).
+        if have_cmd diff; then
+            echo -e "  ${DIM2}── Unified diff ──${NC}"
+            diff -u "$_dpsd_cur" "$_dpsd_plan" 2>/dev/null \
+                | awk -v o="$ERR" -v n="$OK" -v d="$DIM2" -v nc="$NC" '
+                    /^---/ || /^\+\+\+/ { print d $0 nc; next }
+                    /^@@/              { print d $0 nc; next }
+                    /^-/               { print o $0 nc; next }
+                    /^\+/              { print n $0 nc; next }
+                                       { print }
+                  '
+        else
+            echo -e "  ${DIM2}── Set diff ──${NC}"
+            awk -v PLAN="$_dpsd_plan" -v CUR="$_dpsd_cur" \
+                -v N="$OK" -v O="$ERR" -v NC="$NC" '
+                BEGIN {
+                    while ((getline l < PLAN) > 0) if (l != "") plan[l] = 1
+                    close(PLAN)
+                    while ((getline l < CUR)  > 0) if (l != "") cur[l]  = 1
+                    close(CUR)
+                    for (l in plan) if (!(l in cur)) print "  " N "+ " l NC
+                    for (l in cur)  if (!(l in plan)) print "  " O "- " l NC
+                }' | sort -k2
+        fi
+
+        # Hint: query-only drift. Count URIs whose scheme+host+port+uuid
+        # match across both sides; if all differences collapse there, the
+        # panel just rotated session params (sid/token/etc.) — still a real
+        # flush, but reassuring that servers didn't actually change.
+        _dpsd_key() { awk '{k=$0; sub(/[?#].*/,"",k); print k}' "$1" | sort -u; }
+        _dpsd_pk="$(_dpsd_key "$_dpsd_plan")"
+        _dpsd_ck="$(_dpsd_key "$_dpsd_cur")"
+        if [ "$_dpsd_pk" = "$_dpsd_ck" ] && [ -n "$_dpsd_pk" ]; then
+            echo ""
+            echo -e "  ${WARN_C}${ICO_WARN} Same hosts + UUIDs on both sides — only query params rotated${NC}"
+            echo -e "  ${DIM2}  (panels typically rotate reality sid/session tokens each fetch)${NC}"
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${DIM2}Saved for scp:${NC}"
+    echo -e "    ${W}${_dpsd_plan}${NC}"
+    echo -e "    ${W}${_dpsd_cur}${NC}"
+    echo ""
+    PAUSE
+    crumb_pop
 }
 
 do_podkop_urltest_settings() {
