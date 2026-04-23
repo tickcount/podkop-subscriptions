@@ -11,7 +11,7 @@ Fetches and parses proxy subscription URLs, auto-groups nodes by provider, maint
 ## Preview
 
 <center>
-<img width="1960" height="1618" alt="Untitled" src="https://github.com/user-attachments/assets/9598ac0d-40d0-49cf-8bf6-f050fe5cf3c0" />
+<img width="1732" height="1355" alt="Untitled" src="https://github.com/user-attachments/assets/c9d3575f-e229-4cd9-a17e-1c1debdd9344" />
 </center>
 
 ## What it does
