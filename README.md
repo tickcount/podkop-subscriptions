@@ -102,6 +102,10 @@ Each subscription is stored as a UCI section in `/etc/config/mole`. The parsed n
 
 A canonical hash of the planned URI set is compared against what is currently in Podkop before every flush; if they match the operation is a no-op, so restarting Podkop unnecessarily is avoided.
 
+## Disclaimer
+
+Mole is an independent, unofficial tool for managing proxy subscriptions for Podkop. It is not affiliated with, endorsed by, or maintained by the Podkop project.
+
 ## License
 
 MIT
