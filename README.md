@@ -70,7 +70,7 @@ Manages proxy subscriptions end-to-end: fetch → parse → group → filter →
 ## Install
 
 ```bash
-wget -O /usr/bin/mole https://raw.githubusercontent.com/tickcount/podkop-subscriptions/main/mole.sh
+wget -O /usr/bin/mole https://raw.githubusercontent.com/tickcount/mole/main/mole.sh
 chmod +x /usr/bin/mole
 mole
 ```
@@ -78,7 +78,7 @@ mole
 Or run once without installing:
 
 ```bash
-sh <(wget -O - https://raw.githubusercontent.com/tickcount/podkop-subscriptions/main/mole.sh)
+sh <(wget -O - https://raw.githubusercontent.com/tickcount/mole/main/mole.sh)
 ```
 
 ## Requirements
